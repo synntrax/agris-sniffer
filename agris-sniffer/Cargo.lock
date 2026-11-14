@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agris-sniffer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "etherparse",
  "pcap",
@@ -232,7 +232,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sniffer-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]

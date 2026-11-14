@@ -31,9 +31,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install libpcap
+      # libpcap is linked statically: distros name the shared library differently
+      # (Debian/Ubuntu libpcap.so.0.8, Arch/Fedora libpcap.so.1), so a dynamically
+      # linked binary only runs on one family. Built without optional extras
+      # (D-Bus, RDMA, Bluetooth, USB, netlink) so it has no other dependencies.
+      - name: Build static libpcap
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+        env:
+          LIBPCAP: libpcap-1.10.5
+        run: |
+          sudo apt-get update && sudo apt-get install -y flex bison
+          curl -sSfLO "https://www.tcpdump.org/release/$LIBPCAP.tar.xz"
+          sha256sum "$LIBPCAP.tar.xz"
+          tar xf "$LIBPCAP.tar.xz"
+          cd "$LIBPCAP"
+          ./configure --prefix="$RUNNER_TEMP/libpcap" --disable-shared --disable-dbus --disable-rdma \
+            --disable-bluetooth --disable-usb --disable-netmap --without-libnl --without-dpdk
+          make -j"$(nproc)" && make install
+          echo "LIBPCAP_LIBDIR=$RUNNER_TEMP/libpcap/lib" >> "$GITHUB_ENV"
+          echo "LIBPCAP_VER=1.10.5" >> "$GITHUB_ENV"
 
       - name: Install Npcap SDK
         if: runner.os == 'Windows'
@@ -53,6 +69,13 @@ jobs:
           src=agris-sniffer/target/${{ matrix.target }}/release/agris-sniffer
           [[ "${{ runner.os }}" == "Windows" ]] && src="$src.exe"
           cp "$src" "dist/${{ matrix.asset }}"
+
+      - name: Check the Linux binary is portable
+        if: runner.os == 'Linux'
+        run: |
+          ldd "dist/${{ matrix.asset }}"
+          if ldd "dist/${{ matrix.asset }}" | grep -q libpcap; then echo "libpcap is dynamically linked"; exit 1; fi
+          "dist/${{ matrix.asset }}" --version
 
       - uses: actions/attest-build-provenance@v2
         with:
