@@ -3,6 +3,7 @@
 //!
 //! It holds no game data: the item list is supplied at runtime (`--items`).
 
+pub mod filter;
 pub mod items;
 pub mod parser;
 pub mod protocol;

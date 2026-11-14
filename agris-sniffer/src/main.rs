@@ -19,12 +19,13 @@
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use pcap::{Capture, Device, Linktype};
+use sniffer_core::filter::parse_ip_filter;
 use sniffer_core::items::{ItemDb, item_name, parse_items_csv};
 use sniffer_core::parser::{LootHit, parse_payload};
 use sniffer_core::protocol::{InterfaceInfo, PROTOCOL_VERSION, SnifferEvent, VersionInfo};
@@ -32,6 +33,9 @@ use sniffer_core::stream::{FlowKey, TcpReassembler};
 use sniffer_core::tracker::LootOffsetTracker;
 
 const KERNEL_BUFFER_BYTES: i32 = 32 * 1024 * 1024;
+/// Most packet bytes waiting for the parser; beyond this new packets are dropped
+/// (and counted) instead of growing memory without limit.
+const MAX_QUEUED_BYTES: usize = 256 * 1024 * 1024;
 
 fn emit(ev: &SnifferEvent) {
     let mut out = std::io::stdout().lock();
@@ -63,13 +67,7 @@ fn parse_args() -> Args {
             "--iface" => args.iface = it.next(),
             "--items" => args.items = it.next(),
             "--ips" => {
-                args.ips = it
-                    .next()
-                    .unwrap_or_default()
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
+                args.ips = parse_ip_filter(&it.next().unwrap_or_default()).unwrap_or_else(|e| fail(format!("--ips: {e}")))
             }
             other => fail(format!("unknown argument: {other}")),
         }
@@ -77,7 +75,7 @@ fn parse_args() -> Args {
     args
 }
 
-/// Same filter as `build_bpf()` in live_monitor.py.
+/// `ips` are validated IPs/CIDRs (`parse_ip_filter`), so they can't alter the expression.
 fn build_bpf(ips: &[String]) -> String {
     let base = "(tcp or udp)";
     if ips.is_empty() {
@@ -234,17 +232,26 @@ fn run_capture(iface: &str, items: ItemDb, ips: &[String]) {
         });
     }
 
-    // Capture thread: copy packets into an unbounded queue as fast as possible.
+    // Capture thread: copy packets into a byte-budgeted queue as fast as possible.
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let queued = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
+    let overflow = Arc::new(AtomicU64::new(0));
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
     {
         let (stop, queued, dropped) = (stop.clone(), queued.clone(), dropped.clone());
+        let (overflow, queued_bytes) = (overflow.clone(), queued_bytes.clone());
         std::thread::spawn(move || {
             let mut last_stats = Instant::now();
             while !stop.load(Ordering::SeqCst) {
                 match cap.next_packet() {
                     Ok(pkt) => {
+                        let len = pkt.data.len();
+                        if queued_bytes.load(Ordering::Relaxed) + len > MAX_QUEUED_BYTES {
+                            overflow.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        queued_bytes.fetch_add(len, Ordering::Relaxed);
                         queued.fetch_add(1, Ordering::Relaxed);
                         if tx.send(pkt.data.to_vec()).is_err() {
                             return;
@@ -284,7 +291,7 @@ fn run_capture(iface: &str, items: ItemDb, ips: &[String]) {
     let stats = |p: &Processor| SnifferEvent::Stats {
         packets: p.packets,
         matches: p.matches,
-        dropped: dropped.load(Ordering::Relaxed),
+        dropped: dropped.load(Ordering::Relaxed) + overflow.load(Ordering::Relaxed),
         queued: queued.load(Ordering::Relaxed).saturating_sub(p.packets),
         gaps: p.tcp.gaps_skipped,
     };
@@ -293,7 +300,10 @@ fn run_capture(iface: &str, items: ItemDb, ips: &[String]) {
     let mut last_stats = Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(data) => proc.handle(&data),
+            Ok(data) => {
+                proc.handle(&data);
+                queued_bytes.fetch_sub(data.len(), Ordering::Relaxed);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             // Capture thread finished (stop requested) and the queue is drained.
             Err(RecvTimeoutError::Disconnected) => break,

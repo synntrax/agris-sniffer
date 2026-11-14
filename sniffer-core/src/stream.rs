@@ -20,6 +20,12 @@ const KEEP_BEHIND: usize = 64;
 /// Give up waiting for a missing segment after this long / this much buffered.
 const GAP_TIMEOUT_MS: u64 = 1_000;
 const MAX_PENDING_BYTES: usize = 1 << 20;
+/// Also cap the number of out-of-order segments, so a flood of tiny segments
+/// can't make each packet's pending scan expensive.
+const MAX_PENDING_SEGMENTS: usize = 256;
+/// Most flows tracked at once (spoofed 4-tuples could otherwise grow memory);
+/// when full, the least recently active half is forgotten.
+const MAX_FLOWS: usize = 4096;
 /// Resolve trailing prefixes of a flow that has been quiet this long.
 const IDLE_FLUSH_MS: u64 = 150;
 /// Forget flows idle this long.
@@ -156,6 +162,9 @@ impl TcpReassembler {
         now_ms: u64,
     ) -> Vec<LootHit> {
         let mut out = Vec::new();
+        if self.flows.len() >= MAX_FLOWS && !self.flows.contains_key(&key) {
+            self.evict_oldest_half();
+        }
         let flow = self.flows.entry(key).or_default();
         flow.last_seen_ms = now_ms;
 
@@ -170,6 +179,7 @@ impl TcpReassembler {
 
         let oldest_pending = flow.pending.iter().map(|(_, _, t)| *t).min();
         if flow.pending_bytes > MAX_PENDING_BYTES
+            || flow.pending.len() > MAX_PENDING_SEGMENTS
             || oldest_pending.is_some_and(|t| now_ms.saturating_sub(t) > GAP_TIMEOUT_MS)
         {
             self.gaps_skipped += 1;
@@ -215,6 +225,14 @@ impl TcpReassembler {
         }
         self.flows.clear();
         out
+    }
+
+    /// Drop the least recently active half of the flows (amortised O(1) per new flow).
+    fn evict_oldest_half(&mut self) {
+        let mut seen: Vec<u64> = self.flows.values().map(|f| f.last_seen_ms).collect();
+        let mid = seen.len() / 2;
+        let (_, &mut cutoff, _) = seen.select_nth_unstable(mid);
+        self.flows.retain(|_, f| f.last_seen_ms > cutoff);
     }
 
     pub fn flow_count(&self) -> usize {
@@ -350,5 +368,30 @@ mod tests {
         hits.extend(r.flush_all(&mut t));
         assert!(r.gaps_skipped >= 1);
         assert!(total(&hits) >= 2, "records outside the lost segment still count");
+    }
+
+    #[test]
+    fn flow_table_is_bounded() {
+        let mut r = TcpReassembler::new();
+        let mut t = tracker();
+        for i in 0..(MAX_FLOWS as u32 * 3) {
+            let k = FlowKey { src_port: (i % 60000) as u16, dst_port: (i / 60000) as u16, ..key() };
+            r.push(&mut t, k, 1, b"x", false, u64::from(i));
+        }
+        assert!(r.flow_count() <= MAX_FLOWS);
+    }
+
+    #[test]
+    fn many_tiny_out_of_order_segments_are_capped() {
+        let mut r = TcpReassembler::new();
+        let mut t = tracker();
+        r.push(&mut t, key(), 0, b"a", false, 0);
+        // Every segment leaves a 1-byte hole, so none can be appended.
+        for i in 0..2_000u32 {
+            r.push(&mut t, key(), 2 + i * 2, b"z", false, 1);
+        }
+        let flow = r.flows.get(&key()).unwrap();
+        assert!(flow.pending.len() <= MAX_PENDING_SEGMENTS);
+        assert!(r.gaps_skipped > 0);
     }
 }
