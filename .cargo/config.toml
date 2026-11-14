@@ -1,0 +1,7 @@
+# Release profile for standalone builds of this repo (CI releases).
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

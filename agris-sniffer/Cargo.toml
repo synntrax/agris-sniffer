@@ -1,0 +1,13 @@
+[package]
+name = "agris-sniffer"
+version = "0.1.0"
+edition = "2024"
+description = "Packet-capture helper for the Agris loot tracker"
+license = "MIT"
+repository = "https://github.com/synntrax/agris-sniffer"
+
+[dependencies]
+serde_json = "1"
+sniffer-core = { path = "../sniffer-core" }
+pcap = "2"
+etherparse = "0.19"
