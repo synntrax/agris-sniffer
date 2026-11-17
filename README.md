@@ -9,6 +9,7 @@ Agris needs raw packet capture to see loot pickups, so this part runs with eleva
 - Captures packets on one network interface with libpcap (Linux) or Npcap (Windows). It reads only, never sends.
 - Looks for loot records whose item id is in the item list it's given (`--items`), and prints them as JSON lines on stdout.
 - Prints capture stats (packets, matches, drops) so the app can show how healthy the capture is.
+- With `--payloads`, also passes the TCP data the game server sends your PC to the app, unchanged, as JSON lines on stdout. The app uses it to recognise your own character's actions (class detection). The sniffer doesn't interpret it, and it goes nowhere but the app.
 - It contains no game data, makes no network connections, writes no files, and exits when its stdin closes or receives `stop`.
 
 ## Usage
@@ -16,7 +17,7 @@ Agris needs raw packet capture to see loot pickups, so this part runs with eleva
 ```
 agris-sniffer --version
 agris-sniffer --list-interfaces
-agris-sniffer --iface <name> --items <items.csv> [--ips 1.2.3.4,10.0.0.0/8]
+agris-sniffer --iface <name> --items <items.csv> [--ips 1.2.3.4,10.0.0.0/8] [--payloads]
 ```
 
 `items.csv` is an `item_name,item_id` CSV. Output events are defined in [`sniffer-core/src/protocol.rs`](sniffer-core/src/protocol.rs).

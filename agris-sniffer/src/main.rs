@@ -12,10 +12,22 @@
 //! Usage:
 //!   agris-sniffer --version
 //!   agris-sniffer --list-interfaces
-//!   agris-sniffer --iface <name> --items <items.csv> [--ips 1.2.3.4,10.0.0.0/8]
+//!   agris-sniffer --iface <name> --items <items.csv> [--ips 1.2.3.4,10.0.0.0/8] [--payloads]
 //!
 //! `--items` is an `item_name,item_id` CSV of the loot to recognise (the app
 //! supplies it, so this binary contains no game data).
+//!
+//! `--payloads` also forwards what the game server sends this PC, raw, as
+//! `{"type":"payload","peer":"<ip:port>","port":<local port>,"seq":<tcp seq>,"hex":"..."}`
+//! lines on stdout (TCP only, web ports skipped). The sniffer doesn't interpret
+//! them: the app does (class detection, from the server's messages about your own
+//! character's actions).
+//!
+//! Dev builds with the `probe` feature also accept `--probe <file>`: instead of
+//! parsing loot, every TCP payload to or from this PC is appended to `<file>` as
+//! `<unix ms>\t<in|out>\t<remote ip:port>\t<hex>`. Incoming traffic includes what
+//! the server says about nearby players too; the file is local research data only
+//! (for finding the skill-use message) and nothing goes to the app.
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -55,10 +67,12 @@ struct Args {
     iface: Option<String>,
     items: Option<String>,
     ips: Vec<String>,
+    probe: Option<String>,
+    payloads: bool,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { version: false, list_interfaces: false, iface: None, items: None, ips: vec![] };
+    let mut args = Args { version: false, list_interfaces: false, iface: None, items: None, ips: vec![], probe: None, payloads: false };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -69,6 +83,9 @@ fn parse_args() -> Args {
             "--ips" => {
                 args.ips = parse_ip_filter(&it.next().unwrap_or_default()).unwrap_or_else(|e| fail(format!("--ips: {e}")))
             }
+            #[cfg(feature = "probe")]
+            "--probe" => args.probe = it.next(),
+                        "--payloads" => args.payloads = true,
             other => fail(format!("unknown argument: {other}")),
         }
     }
@@ -119,6 +136,76 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// `--probe`: raw TCP payloads in both directions, for reverse-engineering skill records.
+#[cfg(feature = "probe")]
+struct Probe {
+    out: std::io::BufWriter<std::fs::File>,
+    local: std::collections::HashSet<std::net::IpAddr>,
+}
+
+/// This interface's own addresses: traffic from them is what the local player sends.
+fn local_addresses(iface: &str, flag: &str) -> std::collections::HashSet<std::net::IpAddr> {
+    let local: std::collections::HashSet<std::net::IpAddr> = Device::list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.name == iface)
+        .flat_map(|d| d.addresses.into_iter().map(|a| a.addr))
+        .collect();
+    if local.is_empty() {
+        fail(format!("{flag}: interface '{iface}' has no addresses, so outbound traffic can't be told apart"));
+    }
+    local
+}
+
+/// `--payloads`: forward the TCP payloads the game server sends this PC, raw.
+struct PayloadForward {
+    local: std::collections::HashSet<std::net::IpAddr>,
+}
+
+impl PayloadForward {
+    fn emit(&self, src: std::net::IpAddr, src_port: u16, dst: std::net::IpAddr, dst_port: u16, seq: u32, payload: &[u8]) {
+        // Only what arrives here, and never web traffic (HTTPS/HTTP is not the game server).
+        if payload.is_empty() || !self.local.contains(&dst) || matches!(src_port, 80 | 443) {
+            return;
+        }
+        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        let line = serde_json::json!({ "type": "payload", "peer": format!("{src}:{src_port}"), "port": dst_port, "seq": seq, "hex": hex });
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        let _ = writeln!(lock, "{line}");
+        let _ = lock.flush();
+    }
+}
+
+#[cfg(feature = "probe")]
+impl Probe {
+    fn open(path: &str, iface: &str) -> Self {
+        let local = local_addresses(iface, "--probe");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|e| fail(format!("--probe: can't open '{path}': {e}")));
+        Probe { out: std::io::BufWriter::new(file), local }
+    }
+
+    fn record(&mut self, src: std::net::IpAddr, src_port: u16, dst: std::net::IpAddr, dst_port: u16, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        let (dir, peer, port) = if self.local.contains(&src) {
+            ("out", dst, dst_port)
+        } else if self.local.contains(&dst) {
+            ("in", src, src_port)
+        } else {
+            return; // neither end is this PC (promiscuous capture)
+        };
+        let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        let _ = writeln!(self.out, "{ms}\t{dir}\t{peer}:{port}\t{hex}");
+    }
+}
+
 /// Parses queued packets: TCP via stream reassembly, UDP per datagram.
 struct Processor {
     items: ItemDb,
@@ -128,6 +215,9 @@ struct Processor {
     started: Instant,
     packets: u64,
     matches: u64,
+    #[cfg(feature = "probe")]
+    probe: Option<Probe>,
+        payloads: Option<PayloadForward>,
 }
 
 impl Processor {
@@ -149,6 +239,16 @@ impl Processor {
             ),
             _ => return,
         };
+        #[cfg(feature = "probe")]
+        if let Some(probe) = &mut self.probe {
+            if let Some(TransportSlice::Tcp(t)) = &pkt.transport {
+                probe.record(src, t.source_port(), dst, t.destination_port(), t.payload());
+            }
+            return;
+        }
+                if let (Some(fw), Some(TransportSlice::Tcp(t))) = (&self.payloads, &pkt.transport) {
+            fw.emit(src, t.source_port(), dst, t.destination_port(), t.sequence_number(), t.payload());
+        }
         let hits = match &pkt.transport {
             Some(TransportSlice::Tcp(t)) => {
                 let key = FlowKey { src, src_port: t.source_port(), dst, dst_port: t.destination_port() };
@@ -162,12 +262,21 @@ impl Processor {
     }
 
     fn tick(&mut self) {
+        // Keep the probe file current, so a killed sniffer loses at most 100 ms.
+        #[cfg(feature = "probe")]
+        if let Some(probe) = &mut self.probe {
+            let _ = probe.out.flush();
+        }
         let now = self.now_ms();
         let hits = self.tcp.tick(&mut self.tracker, now);
         self.report(hits);
     }
 
     fn flush(&mut self) {
+        #[cfg(feature = "probe")]
+        if let Some(probe) = &mut self.probe {
+            let _ = probe.out.flush();
+        }
         let hits = self.tcp.flush_all(&mut self.tracker);
         self.report(hits);
     }
@@ -194,7 +303,9 @@ fn load_items(path: &str) -> ItemDb {
     items
 }
 
-fn run_capture(iface: &str, items: ItemDb, ips: &[String]) {
+fn run_capture(iface: &str, items: ItemDb, ips: &[String], probe: Option<String>, payloads: bool) {
+    #[cfg(not(feature = "probe"))]
+    let _ = probe;
     let tracker = LootOffsetTracker::new(items.keys().copied().collect());
 
     let mut cap = Capture::from_device(iface)
@@ -287,6 +398,9 @@ fn run_capture(iface: &str, items: ItemDb, ips: &[String]) {
         started: Instant::now(),
         packets: 0,
         matches: 0,
+        #[cfg(feature = "probe")]
+        probe: probe.map(|p| Probe::open(&p, iface)),
+                payloads: payloads.then(|| PayloadForward { local: local_addresses(iface, "--payloads") }),
     };
     let stats = |p: &Processor| SnifferEvent::Stats {
         packets: p.packets,
@@ -333,6 +447,11 @@ fn main() {
         return;
     }
     let Some(iface) = args.iface else { fail("missing --iface <name>") };
-    let Some(items) = args.items else { fail("missing --items <items.csv>") };
-    run_capture(&iface, load_items(&items), &args.ips);
+    // A probe run doesn't parse loot, so it needs no item list.
+    let items = match (args.items, &args.probe) {
+        (Some(path), _) => load_items(&path),
+        (None, Some(_)) => ItemDb::default(),
+        (None, None) => fail("missing --items <items.csv>"),
+    };
+    run_capture(&iface, items, &args.ips, args.probe, args.payloads);
 }
