@@ -5,18 +5,22 @@
 //! are appended in sequence order (retransmitted bytes are trimmed, out-of-order
 //! segments wait in `pending`), and every loot prefix is resolved exactly once,
 //! as soon as enough bytes after it have arrived (or the flow goes idle).
+//! Each `(item_id, qty)` pair is counted at most once, even when several prefixes
+//! are close enough to reach it (the game can repeat the marker).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::parser::{LootHit, PREFIX};
-use crate::tracker::LootOffsetTracker;
+use crate::tracker::{LootOffsetTracker, WINDOW};
 
 /// Bytes needed after a prefix start before it can be resolved:
-/// prefix (4) + tracker window (30) after the anchor.
-const NEED_AFTER: usize = PREFIX.len() + 30;
-/// Bytes kept before the scan position (tracker looks up to 30 bytes back).
-const KEEP_BEHIND: usize = 64;
+/// prefix + tracker window after the anchor.
+const NEED_AFTER: usize = PREFIX.len() + WINDOW;
+/// Bytes kept before the scan position (the tracker looks up to WINDOW bytes back).
+const KEEP_BEHIND: usize = 2 * WINDOW + PREFIX.len();
+/// Size of an `(item_id, qty)` pair.
+const PAIR_LEN: u64 = 8;
 /// Give up waiting for a missing segment after this long / this much buffered.
 const GAP_TIMEOUT_MS: u64 = 1_000;
 const MAX_PENDING_BYTES: usize = 1 << 20;
@@ -50,6 +54,10 @@ struct Flow {
     pending_bytes: usize,
     last_seen_ms: u64,
     flushed: bool,
+    /// Stream bytes dropped from the front of `buf` so far: `buf[i]` is stream byte `base + i`.
+    base: u64,
+    /// Stream position just past the last pair counted: pairs before it are taken.
+    claimed_end: u64,
 }
 
 /// Signed distance from `b` to `a` in sequence space (handles wraparound).
@@ -102,7 +110,9 @@ impl Flow {
                 pos = p; // wait for more bytes
                 break;
             }
-            if let Some((item_id, qty, _)) = tracker.resolve(&self.buf, p + PREFIX.len()) {
+            let min_off = self.claimed_end.saturating_sub(self.base) as usize;
+            if let Some((item_id, qty, off)) = tracker.resolve_from(&self.buf, p + PREFIX.len(), min_off) {
+                self.claimed_end = self.base + off as u64 + PAIR_LEN;
                 out.push(LootHit { item_id, qty });
             }
             pos = p + 1;
@@ -117,6 +127,7 @@ impl Flow {
         let drop = self.scan_from.saturating_sub(KEEP_BEHIND);
         if drop > 0 {
             self.buf.drain(..drop);
+            self.base += drop as u64;
             self.scan_from -= drop;
         }
     }
@@ -124,6 +135,7 @@ impl Flow {
     /// A segment never arrived: resolve what we have, then jump past the gap.
     fn skip_gap(&mut self, tracker: &mut LootOffsetTracker, out: &mut Vec<LootHit>) {
         self.scan(tracker, true, out);
+        self.base += self.buf.len() as u64;
         self.buf.clear();
         self.scan_from = 0;
         let Some(next) = self.next_seq else { return };
@@ -368,6 +380,66 @@ mod tests {
         hits.extend(r.flush_all(&mut t));
         assert!(r.gaps_skipped >= 1);
         assert!(total(&hits) >= 2, "records outside the lost segment still count");
+    }
+
+    fn record(qty: u32) -> Vec<u8> {
+        let mut v = PREFIX.to_vec();
+        v.extend_from_slice(&[0u8; 6]);
+        v.extend_from_slice(&ITEM.to_le_bytes());
+        v.extend_from_slice(&qty.to_le_bytes());
+        v
+    }
+
+    fn feed_window(window: usize, s: &[u8]) -> Vec<LootHit> {
+        let (mut r, mut t) = (TcpReassembler::new(), LootOffsetTracker::with_window([ITEM].into_iter().collect(), window));
+        let mut hits = Vec::new();
+        for (i, c) in s.chunks(11).enumerate() {
+            hits.extend(r.push(&mut t, key(), (i * 11) as u32, c, false, i as u64));
+        }
+        hits.extend(r.flush_all(&mut t));
+        hits
+    }
+
+    #[test]
+    fn repeated_prefix_before_one_pair_counts_once() {
+        for window in [30, 60] {
+            // prefix, prefix, then the record's pair: both anchors reach the pair.
+            let mut s = vec![0xAAu8; 40];
+            s.extend_from_slice(&PREFIX);
+            s.extend_from_slice(&[0u8; 2]);
+            s.extend_from_slice(&record(7));
+            s.extend_from_slice(&[0xBBu8; 80]);
+            let hits = feed_window(window, &s);
+            assert_eq!(hits, vec![LootHit { item_id: ITEM, qty: 7 }], "window {window}");
+        }
+    }
+
+    #[test]
+    fn stray_prefix_after_a_record_counts_once() {
+        for window in [30, 60] {
+            // A record, then a marker with no pair of its own a few bytes later.
+            let mut s = vec![0xAAu8; 40];
+            s.extend_from_slice(&record(3));
+            s.extend_from_slice(&[0xBBu8; 6]);
+            s.extend_from_slice(&PREFIX);
+            s.extend_from_slice(&[0xCCu8; 80]);
+            let hits = feed_window(window, &s);
+            assert_eq!(total(&hits), 3, "window {window}");
+        }
+    }
+
+    #[test]
+    fn back_to_back_records_all_count_with_a_wide_window() {
+        for window in [30, 60] {
+            let mut s = vec![0xAAu8; 40];
+            for q in 1..=5 {
+                s.extend_from_slice(&record(q));
+            }
+            s.extend_from_slice(&[0xBBu8; 80]);
+            let hits = feed_window(window, &s);
+            assert_eq!(hits.len(), 5, "window {window}");
+            assert_eq!(total(&hits), 1 + 2 + 3 + 4 + 5, "window {window}");
+        }
     }
 
     #[test]

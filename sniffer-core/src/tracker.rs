@@ -1,5 +1,9 @@
 use std::collections::HashSet;
 
+/// Bytes searched before and after a prefix anchor for the `(item_id, qty)` pair.
+/// The reassembler sizes its look-ahead / look-behind from this, so change it here only.
+pub const WINDOW: usize = 30;
+
 /// Learns the byte offset between the loot prefix anchor and the
 /// `(item_id: u32 LE, qty: u32 LE)` pair, then uses it as a fast path.
 /// Port of the `LootOffsetTracker` from the original Python prototype.
@@ -18,9 +22,14 @@ fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
 
 impl LootOffsetTracker {
     pub fn new(known_item_ids: HashSet<u32>) -> Self {
+        Self::with_window(known_item_ids, WINDOW)
+    }
+
+    /// Like `new`, with a custom search window (tests).
+    pub fn with_window(known_item_ids: HashSet<u32>, window: usize) -> Self {
         Self {
             known_item_ids,
-            window: 30,
+            window,
             max_qty: 100_000,
             offset: None,
             offset_confidence: 0,
@@ -35,10 +44,11 @@ impl LootOffsetTracker {
         Some((read_u32_le(data, off)?, read_u32_le(data, off + 4)?))
     }
 
-    /// Returns `(item_id, qty, offset_in_data)`.
-    pub fn try_fast_path(&self, data: &[u8], anchor: usize) -> Option<(u32, u32, usize)> {
+    /// Returns `(item_id, qty, offset_in_data)`. Pairs starting before `min_off`
+    /// (already counted) are ignored.
+    pub fn try_fast_path(&self, data: &[u8], anchor: usize, min_off: usize) -> Option<(u32, u32, usize)> {
         let off = anchor as isize + self.offset?;
-        if off < 0 {
+        if off < min_off as isize {
             return None;
         }
         let off = off as usize;
@@ -46,8 +56,8 @@ impl LootOffsetTracker {
         self.valid(item_id, qty).then_some((item_id, qty, off))
     }
 
-    pub fn scan_and_relearn(&mut self, data: &[u8], anchor: usize) -> Option<(u32, u32, usize)> {
-        let lo = anchor.saturating_sub(self.window);
+    pub fn scan_and_relearn(&mut self, data: &[u8], anchor: usize, min_off: usize) -> Option<(u32, u32, usize)> {
+        let lo = anchor.saturating_sub(self.window).max(min_off);
         let hi = (anchor + self.window).min(data.len());
         let mut best: Option<(usize, usize, u32, u32)> = None;
         for off in lo..hi.saturating_sub(7) {
@@ -69,12 +79,20 @@ impl LootOffsetTracker {
     }
 
     pub fn resolve(&mut self, data: &[u8], anchor: usize) -> Option<(u32, u32, usize)> {
-        if let Some(hit) = self.try_fast_path(data, anchor) {
+        self.resolve_from(data, anchor, 0)
+    }
+
+    /// `resolve`, ignoring pairs that start before `min_off`: the caller has already
+    /// counted them. Without this, two prefixes within `window` bytes of one pair
+    /// (the game repeats the marker) both resolve to it and the drop counts twice.
+    /// A rejected anchor also leaves the learned offset alone.
+    pub fn resolve_from(&mut self, data: &[u8], anchor: usize, min_off: usize) -> Option<(u32, u32, usize)> {
+        if let Some(hit) = self.try_fast_path(data, anchor, min_off) {
             self.offset_confidence += 1;
             return Some(hit);
         }
         self.offset_confidence = 0;
-        self.scan_and_relearn(data, anchor)
+        self.scan_and_relearn(data, anchor, min_off)
     }
 
     pub fn offset(&self) -> Option<isize> {
@@ -123,5 +141,17 @@ mod tests {
         let data = buf_with_pair_at(64, 14, 44322, 3);
         assert_eq!(t.resolve(&data, 10), Some((44322, 3, 14)));
         assert_eq!(t.offset(), Some(4));
+    }
+
+    #[test]
+    fn already_counted_pairs_are_ignored_and_keep_the_offset() {
+        for window in [30, 60] {
+            let mut t = LootOffsetTracker::with_window([44322u32].into_iter().collect(), window);
+            let data = buf_with_pair_at(96, 20, 44322, 5);
+            assert_eq!(t.resolve_from(&data, 10, 0), Some((44322, 5, 20)));
+            // A second anchor after the pair would reach back to it.
+            assert_eq!(t.resolve_from(&data, 40, 28), None, "window {window}");
+            assert_eq!(t.offset(), Some(10), "a rejected anchor doesn't relearn");
+        }
     }
 }

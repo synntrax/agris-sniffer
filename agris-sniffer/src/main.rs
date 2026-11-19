@@ -85,7 +85,7 @@ fn parse_args() -> Args {
             }
             #[cfg(feature = "probe")]
             "--probe" => args.probe = it.next(),
-                        "--payloads" => args.payloads = true,
+            "--payloads" => args.payloads = true,
             other => fail(format!("unknown argument: {other}")),
         }
     }
@@ -157,6 +157,18 @@ fn local_addresses(iface: &str, flag: &str) -> std::collections::HashSet<std::ne
     local
 }
 
+/// Lower-case hex of `bytes`, in one allocation (this runs for every forwarded or
+/// probed packet, so no per-byte `format!`).
+fn to_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// `--payloads`: forward the TCP payloads the game server sends this PC, raw.
 struct PayloadForward {
     local: std::collections::HashSet<std::net::IpAddr>,
@@ -168,7 +180,7 @@ impl PayloadForward {
         if payload.is_empty() || !self.local.contains(&dst) || matches!(src_port, 80 | 443) {
             return;
         }
-        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = to_hex(payload);
         let line = serde_json::json!({ "type": "payload", "peer": format!("{src}:{src_port}"), "port": dst_port, "seq": seq, "hex": hex });
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
@@ -201,7 +213,7 @@ impl Probe {
             return; // neither end is this PC (promiscuous capture)
         };
         let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = to_hex(payload);
         let _ = writeln!(self.out, "{ms}\t{dir}\t{peer}:{port}\t{hex}");
     }
 }
@@ -217,7 +229,7 @@ struct Processor {
     matches: u64,
     #[cfg(feature = "probe")]
     probe: Option<Probe>,
-        payloads: Option<PayloadForward>,
+    payloads: Option<PayloadForward>,
 }
 
 impl Processor {
@@ -246,7 +258,7 @@ impl Processor {
             }
             return;
         }
-                if let (Some(fw), Some(TransportSlice::Tcp(t))) = (&self.payloads, &pkt.transport) {
+        if let (Some(fw), Some(TransportSlice::Tcp(t))) = (&self.payloads, &pkt.transport) {
             fw.emit(src, t.source_port(), dst, t.destination_port(), t.sequence_number(), t.payload());
         }
         let hits = match &pkt.transport {
@@ -400,7 +412,7 @@ fn run_capture(iface: &str, items: ItemDb, ips: &[String], probe: Option<String>
         matches: 0,
         #[cfg(feature = "probe")]
         probe: probe.map(|p| Probe::open(&p, iface)),
-                payloads: payloads.then(|| PayloadForward { local: local_addresses(iface, "--payloads") }),
+        payloads: payloads.then(|| PayloadForward { local: local_addresses(iface, "--payloads") }),
     };
     let stats = |p: &Processor| SnifferEvent::Stats {
         packets: p.packets,
@@ -454,4 +466,14 @@ fn main() {
         (None, None) => fail("missing --items <items.csv>"),
     };
     run_capture(&iface, items, &args.ips, args.probe, args.payloads);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hex_matches_format() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let expected: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(super::to_hex(&bytes), expected);
+    }
 }

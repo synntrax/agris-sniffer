@@ -1,6 +1,6 @@
 [package]
 name = "sniffer-core"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Loot-record parsing and TCP reassembly for the Agris packet sniffer"
 license = "MIT"

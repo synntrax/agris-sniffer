@@ -1,6 +1,6 @@
 [package]
 name = "agris-sniffer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Packet-capture helper for the Agris loot tracker"
 license = "MIT"
